@@ -1,131 +1,138 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Input  : text_no_spaces
-Target : spaced text (ground truth)
+Скрипт для инференса модели восстановления пробелов.
 
-Example usage:
-python train_seq2seq_spacing.py \
-  --train_json data/dataset_1937770_3.csv \
-  --model_name ai-forever/ruT5-large \
-  --output_dir models/ruT5-large \
-  --epochs 5 --batch_size 16 --lr 5e-4 --val_frac 0.1 --seed 42
+Выводит два файла:
+- JSONL: {"id", "spaced", "splits"} для каждой строки
+- TXT: строки с восстановленными пробелами
+
+Пример запуска:
+python infer_seq2seq_spacing.py --model_dir models/byt5-spacer \
+  --in_file data/test.csv --in_format csv \
+  --out_json data/pred.jsonl --out_txt data/pred.txt
 """
-import argparse, json, math
+import argparse, os, json, re
 import torch
-from torch.utils.data import Dataset, random_split
-from transformers import (AutoTokenizer, AutoModelForSeq2SeqLM,
-                          DataCollatorForSeq2Seq, Seq2SeqTrainingArguments,
-                          Seq2SeqTrainer, set_seed)
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-def load_json(path: str):
-    with open(path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    out = []
-    for r in data:
-        if not r: 
+def read_inputs(path: str, in_format: str):
+    """Чтение входных данных (поддерживается CSV).
+    Каждая строка: id,text_no_spaces
+    Возвращает список (id, text).
+    """
+    items = []
+    if in_format == 'csv':
+        with open(path, 'r', encoding='utf-8-sig', errors='replace') as f:
+            first = True
+            for i, line in enumerate(f):
+                s = line.rstrip("\r\n")
+                if not s.strip():
+                    continue
+                if first:
+                    left = s.split(",", 1)[0]
+                    if (not left.isdigit()) and ('text' in s.lower()):
+                        first = False
+                        continue
+                    first = False
+                if "," not in s:
+                    items.append((i, s.strip()))
+                    continue
+                left, right = s.split(",", 1)
+                left = left.strip()
+                try:
+                    rid = int(left)
+                except ValueError:
+                    rid = left
+                text = right.strip()
+                if text:
+                    items.append((rid, text))
+        return items
+    else:
+        raise ValueError('Unsupported in_format')
+
+def spaced_to_splits(no_space: str, spaced: str):
+    """Вычисляем позиции вставленных пробелов.
+    Возвращает список индексов, после каких символов был вставлен пробел.
+    """
+    idx = 0; splits = []
+    for ch in spaced:
+        if ch.isspace():
+            if idx>0: splits.append(idx-1)
             continue
-        src = r.get('text_no_spaces') or r.get('no_spaces') or r.get('input') or r.get('text')
-        tgt = r.get('spaced') or r.get('text_with_spaces') or r.get('target')
-        if not (src and tgt):
-            splits = r.get('splits')
-            if src and splits is not None:
-                s = list(src)
-                out_str = []
-                for i,ch in enumerate(s):
-                    out_str.append(ch)
-                    if i in set(splits):
-                        out_str.append(' ')
-                tgt = ''.join(out_str).strip()
-        if src and tgt:
-            out.append({'src': src, 'tgt': tgt})
-    return out
-
-class PairDataset(Dataset):
-    def __init__(self, pairs, tokenizer, max_src_len=128, max_tgt_len=128):
-        self.pairs = pairs
-        self.tok = tokenizer
-        self.max_src_len = max_src_len
-        self.max_tgt_len = max_tgt_len
-    def __len__(self): return len(self.pairs)
-    def __getitem__(self, idx):
-        s = self.pairs[idx]['src']
-        t = self.pairs[idx]['tgt']
-        model_inputs = self.tok(
-            s, max_length=self.max_src_len, truncation=True, padding=False, return_tensors="pt"
-        )
-        with self.tok.as_target_tokenizer():
-            labels = self.tok(
-                t, max_length=self.max_tgt_len, truncation=True, padding=False, return_tensors="pt"
-            )
-        model_inputs = {k: v.squeeze(0) for k, v in model_inputs.items()}
-        model_inputs['labels'] = labels['input_ids'].squeeze(0)
-        return model_inputs
+        if idx >= len(no_space):
+            break
+        idx += 1
+    return splits
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--train_json', required=True,)
-    ap.add_argument('--model_name', default='ai-forever/ruT5-large')
-    ap.add_argument('--output_dir', required=True)
-    ap.add_argument('--epochs', type=int, default=10)
-    ap.add_argument('--batch_size', type=int, default=20)
-    ap.add_argument('--lr', type=float, default=5e-4)
-    ap.add_argument('--val_frac', type=float, default=0.1)
-    ap.add_argument('--seed', type=int, default=42)
-    ap.add_argument('--max_src_len', type=int, default=128)
-    ap.add_argument('--max_tgt_len', type=int, default=128)
-    ap.add_argument('--freeze_encoder', action='store_true')
+    # пути и параметры модели/файлов
+    ap.add_argument('--model_dir', required=True)
+    ap.add_argument('--in_file', required=True)
+    ap.add_argument('--in_format', choices=['csv'], default='csv') # поддерживается только csv
+    ap.add_argument('--out_json', required=True)
+    ap.add_argument('--out_txt', required=True)
+    # гиперпараметры генерации
+    ap.add_argument('--max_new_tokens', type=int, default=128)
+    ap.add_argument('--batch_size', type=int, default=16)
+    ap.add_argument('--num_beams', type=int, default=4)
+    ap.add_argument('--no_repeat_ngram_size', type=int, default=3)
+    ap.add_argument('--repetition_penalty', type=float, default=1.2)
+    ap.add_argument('--length_penalty', type=float, default=0.8)
+    ap.add_argument('--encoder_no_repeat_ngram_size', type=int, default=0)
+
     args = ap.parse_args()
 
-    set_seed(args.seed)
+    # загружаем модель и токенайзер
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    tok = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True)
+    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_dir).to(device)
+    model.eval()
 
-    data = load_json(args.train_json)
-    if len(data) < 50:
-        raise RuntimeError(f'Not enough pairs after parsing: {len(data)}')
+    # читаем входные данные
+    items = read_inputs(args.in_file, args.in_format)
+    outs = []
+    texts = [t for _, t in items]
+    ids = [i for i, _ in items]
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name)
+    # динамический лимит на число новых токенов (~25% от длины входа)
+    def dyn_max_new(src: str, cap: int) -> int:
+        return min(cap, max(8, int(len(src) * 0.25)))
 
-    if args.freeze_encoder:
-        if hasattr(model, 'get_encoder'):
-            for p in model.get_encoder().parameters():
-                p.requires_grad = False
+    for start in range(0, len(texts), args.batch_size):
+        batch = texts[start:start + args.batch_size]
+        enc = tok(batch, return_tensors='pt', padding=True, truncation=True).to(device)
 
-    ds = PairDataset(data, tokenizer, args.max_src_len, args.max_tgt_len)
+        max_new = [dyn_max_new(s, args.max_new_tokens) for s in batch]
+        max_new_tokens = int(max(max_new) if max_new else args.max_new_tokens)
 
-    val_size = max(1, int(len(ds) * args.val_frac))
-    train_size = len(ds) - val_size
-    train_ds, val_ds = random_split(ds, [train_size, val_size], generator=torch.Generator().manual_seed(args.seed))
+        # генерация с beam search
+        with torch.no_grad():
+            gen = model.generate(
+                **enc,
+                max_new_tokens=max_new_tokens,
+                num_beams=args.num_beams,
+                length_penalty=args.length_penalty,
+                no_repeat_ngram_size=args.no_repeat_ngram_size,
+                encoder_no_repeat_ngram_size=args.encoder_no_repeat_ngram_size,
+                repetition_penalty=args.repetition_penalty,
+                early_stopping=True
+            )
+        # раскодируем токены в строки
+        dec = tok.batch_decode(gen, skip_special_tokens=True)
+        for rid, src, pred in zip(ids[start:start+args.batch_size], batch, dec):
+            spaced = re.sub(r'\s+', ' ', pred).strip()  # чистим лишние пробелы
+            splits = spaced_to_splits(src, spaced)      # восстанавливаем индексы вставок
+            outs.append({'id': int(rid), 'spaced': spaced, 'splits': splits})
 
-    collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding='longest')
-
-    steps_per_epoch = math.ceil(train_size / args.batch_size)
-    warmup_steps = max(10, int(0.06 * steps_per_epoch * args.epochs))
-
-    training_args = Seq2SeqTrainingArguments(
-        output_dir=args.output_dir,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        learning_rate=args.lr,
-        warmup_steps=warmup_steps,
-        logging_steps=25,
-        save_total_limit=2,
-        seed=args.seed
-    )
-
-    trainer = Seq2SeqTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        data_collator=collator,
-        tokenizer=tokenizer,
-    )
-
-    trainer.train()
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+    os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
+    with open(args.out_json, 'w', encoding='utf-8') as f:
+        for r in outs:
+            f.write(json.dumps(r, ensure_ascii=False) + '\n')
+    with open(args.out_txt, 'w', encoding='utf-8') as f:
+        for r in outs:
+            f.write(r['spaced'] + '\n')
 
 if __name__ == '__main__':
     main()
