@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Outputs:
-- JSONL with {"id", "spaced", "splits"} for each input row
-- TXT with spaced lines
-Example:
+Скрипт для инференса модели восстановления пробелов.
+
+Выводит два файла:
+- JSONL: {"id", "spaced", "splits"} для каждой строки
+- TXT: строки с восстановленными пробелами
+
+Пример запуска:
 python infer_seq2seq_spacing.py --model_dir models/byt5-spacer \
   --in_file data/test.csv --in_format csv \
   --out_json data/pred.jsonl --out_txt data/pred.txt
@@ -14,6 +17,10 @@ import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 def read_inputs(path: str, in_format: str):
+    """Чтение входных данных (поддерживается CSV).
+    Каждая строка: id,text_no_spaces
+    Возвращает список (id, text).
+    """
     items = []
     if in_format == 'csv':
         with open(path, 'r', encoding='utf-8-sig', errors='replace') as f:
@@ -45,6 +52,9 @@ def read_inputs(path: str, in_format: str):
         raise ValueError('Unsupported in_format')
 
 def spaced_to_splits(no_space: str, spaced: str):
+    """Вычисляем позиции вставленных пробелов.
+    Возвращает список индексов, после каких символов был вставлен пробел.
+    """
     idx = 0; splits = []
     for ch in spaced:
         if ch.isspace():
@@ -57,11 +67,13 @@ def spaced_to_splits(no_space: str, spaced: str):
 
 def main():
     ap = argparse.ArgumentParser()
+    # пути и параметры модели/файлов
     ap.add_argument('--model_dir', required=True)
     ap.add_argument('--in_file', required=True)
-    ap.add_argument('--in_format', choices=['csv'], default='csv') # requires csv
+    ap.add_argument('--in_format', choices=['csv'], default='csv') # поддерживается только csv
     ap.add_argument('--out_json', required=True)
     ap.add_argument('--out_txt', required=True)
+    # гиперпараметры генерации
     ap.add_argument('--max_new_tokens', type=int, default=128)
     ap.add_argument('--batch_size', type=int, default=16)
     ap.add_argument('--num_beams', type=int, default=4)
@@ -72,16 +84,19 @@ def main():
 
     args = ap.parse_args()
 
+    # загружаем модель и токенайзер
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tok = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_dir).to(device)
     model.eval()
 
+    # читаем входные данные
     items = read_inputs(args.in_file, args.in_format)
     outs = []
     texts = [t for _, t in items]
     ids = [i for i, _ in items]
 
+    # динамический лимит на число новых токенов (~25% от длины входа)
     def dyn_max_new(src: str, cap: int) -> int:
         return min(cap, max(8, int(len(src) * 0.25)))
 
@@ -92,6 +107,7 @@ def main():
         max_new = [dyn_max_new(s, args.max_new_tokens) for s in batch]
         max_new_tokens = int(max(max_new) if max_new else args.max_new_tokens)
 
+        # генерация с beam search
         with torch.no_grad():
             gen = model.generate(
                 **enc,
@@ -103,10 +119,11 @@ def main():
                 repetition_penalty=args.repetition_penalty,
                 early_stopping=True
             )
+        # раскодируем токены в строки
         dec = tok.batch_decode(gen, skip_special_tokens=True)
         for rid, src, pred in zip(ids[start:start+args.batch_size], batch, dec):
-            spaced = re.sub(r'\s+', ' ', pred).strip()
-            splits = spaced_to_splits(src, spaced)
+            spaced = re.sub(r'\s+', ' ', pred).strip()  # чистим лишние пробелы
+            splits = spaced_to_splits(src, spaced)      # восстанавливаем индексы вставок
             outs.append({'id': int(rid), 'spaced': spaced, 'splits': splits})
 
     os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
