@@ -76,3 +76,4 @@ python3.12 src/infer_seq2seq_spacing.py \
 
 * Видеокарта: NVIDIA RTX 5070 (9 ГБ VRAM занято только моделью на обучении)
 * Модель: models/ruT5Large 737M
+* Дообученную модель можно скачать по ссылке: https://disk.yandex.ru/d/uDlgMV18LZMM7g
